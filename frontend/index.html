@@ -2,8 +2,8 @@
 <html lang="en">
 
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Search Mini</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -13,15 +13,15 @@
 
         @keyframes float {
             0% {
-                transform: translateY(0px);
+                transform: translateY(0)
             }
 
             50% {
-                transform: translateY(-8px);
+                transform: translateY(-8px)
             }
 
             100% {
-                transform: translateY(0px);
+                transform: translateY(0)
             }
         }
 
@@ -64,12 +64,11 @@
             <div class="relative shadow-lg rounded-full">
                 <input type="text" id="search-input" placeholder="Search the crawled web..."
                     class="w-full px-6 py-4 text-lg border-2 border-transparent rounded-full focus:outline-none focus:ring-4 focus:ring-teal-300 transition duration-300"
-                    required>
+                    required />
                 <button type="submit"
                     class="absolute top-0 right-0 mt-2 mr-2 px-5 py-3 bg-teal-600 text-white font-semibold rounded-full hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 flex items-center">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
-                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-                        class="h-5 w-5">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" stroke="currentColor"
+                        stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-5 w-5">
                         <circle cx="11" cy="11" r="8"></circle>
                         <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                     </svg>
@@ -85,31 +84,20 @@
         </main>
     </div>
 
-    <footer class="text-center p-4 text-gray-500 text-sm">Curiosity is a good thing, if you channel your energy in the right direction</footer>
+    <footer class="text-center p-4 text-gray-500 text-sm">
+        Curiosity is a good thing, if you channel your energy in the right direction
+    </footer>
 
     <script>
-        // DOM Elements
+        // Elements
         const searchForm = document.getElementById('search-form');
         const searchInput = document.getElementById('search-input');
         const resultsContainer = document.getElementById('results-container');
 
-        const API_URL = "https://mini-search-vw10.onrender.com";  // Render URL
+        // IMPORTANT: point this to your Render backend
+        const API_URL = "https://mini-search-vw10.onrender.com";
 
-            async function search(query) {
-                    try {
-                        const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}`);
-                        if (!response.ok) throw new Error("API error");
-                        const data = await response.json();
-                        console.log(data);
-                        return data;
-                    } catch (err) {
-                        console.error(err);
-                        showError("Could not connect to the search engine. Is the backend running?");
-                    }
-                }
-
-
-        // --- Event Listener ---
+        // Submit handler
         searchForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             const query = searchInput.value.trim();
@@ -117,12 +105,16 @@
             await performSearch(query);
         });
 
-        // --- Functions ---
         async function performSearch(query) {
             showLoading('Searching...');
             try {
-                const response = await fetch(`${API_URL}?q=${encodeURIComponent(query)}`);
-                if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                // FIX: include /search (was missing before)
+                const response = await fetch(`${API_URL}/search?q=${encodeURIComponent(query)}`);
+                if (!response.ok) {
+                    // show helpful error if index is still building
+                    const text = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${text}`);
+                }
                 const data = await response.json();
                 displayResults(data);
             } catch (error) {
@@ -132,15 +124,24 @@
         }
 
         function showLoading(message = 'Loading...') {
-            resultsContainer.innerHTML = `<div class="flex justify-center items-center flex-col py-10"><div class="spinner"></div><p class="mt-4 text-gray-600">${message}</p></div>`;
+            resultsContainer.innerHTML =
+                `<div class="flex justify-center items-center flex-col py-10">
+           <div class="spinner"></div>
+           <p class="mt-4 text-gray-600">${message}</p>
+         </div>`;
         }
 
         function showError(message) {
-            resultsContainer.innerHTML = `<div class="text-center text-red-500 bg-red-100 p-4 rounded-lg"><p class="font-bold">An Error Occurred</p><p>${message}</p></div>`;
+            resultsContainer.innerHTML =
+                `<div class="text-center text-red-500 bg-red-100 p-4 rounded-lg">
+           <p class="font-bold">An Error Occurred</p>
+           <p>${message}</p>
+         </div>`;
         }
 
         function displayResults(data) {
             resultsContainer.innerHTML = '';
+
             const summary = document.createElement('p');
             summary.className = 'text-gray-600 mb-6';
             summary.textContent = `Found ${data.count} results for "${data.query}".`;
@@ -152,18 +153,17 @@
             }
 
             data.results.forEach(result => {
-                const resultElement = document.createElement('div');
-                resultElement.className = 'bg-white p-5 mb-4 rounded-lg border shadow-sm hover:shadow-xl hover:-translate-y-1 transition-all';
-
-                resultElement.innerHTML = `
-                    <h3 class="text-xl font-semibold text-teal-700 mb-1">
-                        <a href="${result.id}" target="_blank" rel="noopener noreferrer" class="hover:underline">${truncateUrl(result.id)}</a>
-                    </h3>
-                    <a href="${result.id}" target="_blank" rel="noopener noreferrer" class="text-green-600 text-sm hover:underline break-all">${result.id}</a>
-                    <p class="text-gray-600 mt-2 snippet">${result.snippet}</p>
-                    <p class="text-gray-500 mt-2 text-right">Relevance Score: <span class="font-medium">${result.score}</span></p>
-                `;
-                resultsContainer.appendChild(resultElement);
+                const el = document.createElement('div');
+                el.className = 'bg-white p-5 mb-4 rounded-lg border shadow-sm hover:shadow-xl hover:-translate-y-1 transition-all';
+                el.innerHTML = `
+          <h3 class="text-xl font-semibold text-teal-700 mb-1">
+            <a href="${result.id}" target="_blank" rel="noopener noreferrer" class="hover:underline">${truncateUrl(result.id)}</a>
+          </h3>
+          <a href="${result.id}" target="_blank" rel="noopener noreferrer" class="text-green-600 text-sm hover:underline break-all">${result.id}</a>
+          <p class="text-gray-600 mt-2 snippet">${result.snippet}</p>
+          <p class="text-gray-500 mt-2 text-right">Relevance Score: <span class="font-medium">${result.score}</span></p>
+        `;
+                resultsContainer.appendChild(el);
             });
         }
 
@@ -172,7 +172,9 @@
                 const path = new URL(url).pathname;
                 let title = decodeURIComponent(path.split('/').pop().replace(/_/g, ' '));
                 return title.replace(/\.[^/.]+$/, "") || url;
-            } catch (e) { return url; }
+            } catch {
+                return url;
+            }
         }
     </script>
 </body>
