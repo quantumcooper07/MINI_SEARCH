@@ -93,7 +93,12 @@
         const searchInput = document.getElementById('search-input');
         const resultsContainer = document.getElementById('results-container');
 
-        const API_URL = 'http://127.0.0.1:5000/search';
+        const API_URL = "https://mini-search-vw10.onrender.com";  // Render URL
+
+            fetch(`${API_URL}/search?q=example`)
+                .then(res => res.json())
+                .then(data => console.log(data));
+
 
         // --- Event Listener ---
         searchForm.addEventListener('submit', async (e) => {
