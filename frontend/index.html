@@ -95,7 +95,13 @@
         const resultsContainer = document.getElementById('results-container');
 
         // IMPORTANT: point this to your Render backend
-        const API_URL = "https://mini-search-vw10.onrender.com";
+        const API_URL = import.meta.env.VITE_API_URL;
+
+            export async function search(query) {
+                const response = await fetch(`${API_URL}/search?q=${encodeURIComponent(query)}`);
+                return response.json();
+            }
+
 
         // Submit handler
         searchForm.addEventListener('submit', async (e) => {
