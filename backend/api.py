@@ -1,3 +1,4 @@
+import os
 import logging
 import math
 import re
@@ -249,6 +250,9 @@ def search_api():
         "count": len(results),
         "results": results
     })
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"message": "Backend is running"}), 200
 
 
 # --- Main Execution ---
@@ -263,5 +267,5 @@ if __name__ == "__main__":
     else:
         logging.error("Could not initialize search engine: No data was crawled.")
 
-    # Use a production-ready WSGI server in a real deployment
-    app.run(debug=False, port=5000)
+    port = int(os.environ.get("PORT", 5000))  # Render provides $PORT
+    app.run(host="0.0.0.0", port=port)

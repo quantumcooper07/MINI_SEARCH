@@ -95,9 +95,18 @@
 
         const API_URL = "https://mini-search-vw10.onrender.com";  // Render URL
 
-            fetch(`${API_URL}/search?q=example`)
-                .then(res => res.json())
-                .then(data => console.log(data));
+            async function search(query) {
+                    try {
+                        const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}`);
+                        if (!response.ok) throw new Error("API error");
+                        const data = await response.json();
+                        console.log(data);
+                        return data;
+                    } catch (err) {
+                        console.error(err);
+                        showError("Could not connect to the search engine. Is the backend running?");
+                    }
+                }
 
 
         // --- Event Listener ---
