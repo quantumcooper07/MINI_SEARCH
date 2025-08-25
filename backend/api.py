@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import time
+import threading
 from collections import defaultdict
 from urllib.parse import urljoin, urlparse
 
@@ -16,12 +17,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
-CORS(app)
+CORS(app) # Enable CORS for all routes
 
 # --- Crawler Configuration ---
 STARTING_URL = "https://en.wikipedia.org/wiki/Python_(programming_language)"
 MAX_PAGES_TO_CRAWL = 20
-REQUEST_DELAY = 1
+REQUEST_DELAY = 1 # Be respectful to the server
 HEADERS = {'User-Agent': 'SimpleSearchBot/1.0 (Project for resume)'}
 
 # --- Stop Words ---
@@ -46,13 +47,13 @@ class Indexer:
         logging.info("Starting the indexing process...")
         self.documents = crawled_data
 
-        # TF
+        # TF (Term Frequency)
         for url, text in self.documents.items():
             tokens = self._preprocess_text(text)
             for token in tokens:
                 self.inverted_index[token][url] += 1
 
-        # IDF
+        # IDF (Inverse Document Frequency)
         num_documents = len(self.documents)
         if num_documents == 0:
             logging.warning("No documents to index.")
@@ -82,6 +83,7 @@ class Indexer:
         end = start + length
         snippet = text[start:end]
 
+        # Highlight all query tokens found in the snippet
         for token in query_tokens:
             snippet = re.sub(f'({re.escape(token)})', r'<strong>\1</strong>', snippet, flags=re.IGNORECASE)
 
@@ -95,16 +97,19 @@ class Indexer:
             return []
 
         try:
+            # Start with documents that contain the first token
             matching_urls = set(self.inverted_index[query_tokens[0]].keys())
         except KeyError:
-            return []
+            return [] # First token not in index, so no results
 
+        # Find the intersection of documents for all tokens
         for token in query_tokens[1:]:
             matching_urls.intersection_update(self.inverted_index.get(token, {}).keys())
 
         if not matching_urls:
             return []
 
+        # Calculate TF-IDF scores for matching documents
         url_scores = defaultdict(float)
         for url in matching_urls:
             score = 0.0
@@ -114,8 +119,10 @@ class Indexer:
                 score += tf * idf
             url_scores[url] = score
 
+        # Sort results by score
         sorted_results = sorted(url_scores.items(), key=lambda item: item[1], reverse=True)
 
+        # Format the final results
         final_results = []
         for url, score in sorted_results:
             final_results.append({
@@ -133,11 +140,11 @@ class WebCrawler:
         self.visited_urls: set[str] = set()
         self.url_queue: list[str] = [start_url]
         self.crawled_data: dict[str, str] = {}
+        self.base_netloc = urlparse(start_url).netloc
 
     def _is_valid_url(self, url: str) -> bool:
-        parsed_start_url = urlparse(self.start_url)
         parsed_url = urlparse(url)
-        return (parsed_url.scheme in ['http', 'https'] and parsed_url.netloc == parsed_start_url.netloc)
+        return parsed_url.scheme in ['http', 'https'] and parsed_url.netloc == self.base_netloc
 
     def crawl(self) -> dict[str, str]:
         logging.info("Starting web crawl...")
@@ -146,21 +153,26 @@ class WebCrawler:
             if current_url in self.visited_urls:
                 continue
 
-            logging.info(f"Crawling: {current_url}")
+            logging.info(f"Crawling ({len(self.crawled_data) + 1}/{self.max_pages}): {current_url}")
             try:
                 response = requests.get(current_url, timeout=10, headers=HEADERS)
                 response.raise_for_status()
 
                 self.visited_urls.add(current_url)
                 soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # A simple way to get cleaner text
+                for script_or_style in soup(["script", "style"]):
+                    script_or_style.decompose()
                 page_text = ' '.join(soup.stripped_strings)
                 self.crawled_data[current_url] = page_text
 
+                # Find new links to crawl
                 for link in soup.find_all('a', href=True):
                     absolute_url = urljoin(current_url, link['href']).split('#')[0]
                     if self._is_valid_url(absolute_url) and absolute_url not in self.visited_urls:
                         self.url_queue.append(absolute_url)
-
+                
                 time.sleep(REQUEST_DELAY)
 
             except requests.exceptions.RequestException as e:
@@ -169,13 +181,14 @@ class WebCrawler:
         logging.info(f"Crawl finished. Found {len(self.crawled_data)} pages.")
         return self.crawled_data
 
-# --- Global Search Engine Instance ---
+# --- Global State and Instances ---
 search_indexer = Indexer()
 _index_ready = False
 
 # --- API Endpoints ---
 @app.route("/", methods=["GET"])
 def home():
+    """Provides the status of the backend."""
     status = "ready" if _index_ready else "indexing"
     return jsonify({"message": "Backend is running", "status": status}), 200
 
@@ -198,23 +211,33 @@ def search_api():
         "results": results
     })
 
-def build_index():
-    """Crawl and build index at startup."""
+# --- Background Task for Crawling and Indexing ---
+def crawl_and_build_index():
+    """
+    This function runs in a background thread.
+    It crawls the web, builds the index, and sets the ready flag.
+    """
     global _index_ready
+    logging.info("Background indexing process started.")
     try:
         crawler = WebCrawler(start_url=STARTING_URL, max_pages=MAX_PAGES_TO_CRAWL)
         crawled_data = crawler.crawl()
         if crawled_data:
             search_indexer.create_index(crawled_data)
             _index_ready = True
-            logging.info("Search engine is ready and running.")
+            logging.info("✅ Search engine is now ready.")
         else:
             logging.error("Could not initialize search engine: No data was crawled.")
     except Exception as e:
-        logging.exception(f"Index build failed: {e}")
+        logging.exception(f"A critical error occurred during the index build: {e}")
 
-if __name__ == "__main__":
-    logging.info("Initializing search engine...")
-    build_index()
-    port = int(os.environ.get("PORT", 5000))  # Render provides $PORT
-    app.run(host="0.0.0.0", port=port, debug=False)
+# --- Start Background Thread ---
+# This code runs when Gunicorn starts the application.
+# It ensures the time-consuming crawl doesn't block the server.
+logging.info("Initializing search engine in a background thread...")
+indexing_thread = threading.Thread(target=crawl_and_build_index)
+indexing_thread.daemon = True  # Allows app to exit even if thread is running
+indexing_thread.start()
+
+# The 'if __name__ == "__main__"' block is removed because Gunicorn
+# does not run it. The background thread starts when the module is loaded.
