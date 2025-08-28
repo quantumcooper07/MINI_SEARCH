@@ -1,39 +1,68 @@
 import os
-import logging
-import math
 import re
+import math
 import time
+import atexit
+import signal
+import logging
 import threading
 from collections import defaultdict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# --- Basic Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# =========================
+# Config
+# =========================
+DEFAULT_START_URL = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+STARTING_URL = os.getenv("STARTING_URL", DEFAULT_START_URL)
+MAX_PAGES_TO_CRAWL = int(os.getenv("MAX_PAGES_TO_CRAWL", "20"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
 
-# --- Flask App Initialization ---
-app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "SimpleSearchBot/1.1 (+https://example.com/resume; for demo; contact=you@example.com)"
+)
 
-# --- Crawler Configuration ---
-STARTING_URL = "https://en.wikipedia.org/wiki/Python_(programming_language)"
-MAX_PAGES_TO_CRAWL = 20
-REQUEST_DELAY = 1 # Be respectful to the server
-HEADERS = {'User-Agent': 'SimpleSearchBot/1.0 (Project for resume)'}
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# --- Stop Words ---
 STOP_WORDS = {
     'a', 'an', 'the', 'and', 'in', 'is', 'it', 'of', 'for', 'on', 'with', 'to',
     'was', 'as', 'by', 'that', 'this', 'at', 'from', 'but', 'or', 'be', 'are'
 }
 
+# =========================
+# Utilities
+# =========================
+def make_retrying_session() -> requests.Session:
+    """Create a requests session with retries and polite headers."""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"])
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+# =========================
+# Indexer
+# =========================
 class Indexer:
-    """Manages the indexing of web content and searching."""
+    """Thread-safe inverted index with TF-IDF scoring."""
     def __init__(self):
+        self._lock = threading.RLock()
         self.inverted_index: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
         self.documents: dict[str, str] = {}
         self.idf_scores: dict[str, float] = {}
@@ -41,52 +70,54 @@ class Indexer:
     def _preprocess_text(self, text: str) -> list[str]:
         text = text.lower()
         tokens = re.findall(r'\b[a-z]+\b', text)
-        return [token for token in tokens if token not in STOP_WORDS]
+        return [t for t in tokens if t not in STOP_WORDS]
 
-    def create_index(self, crawled_data: dict[str, str]) -> None:
-        logging.info("Starting the indexing process...")
-        self.documents = crawled_data
+    def rebuild(self, crawled_data: dict[str, str]) -> None:
+        """Rebuild index from scratch."""
+        with self._lock:
+            logger.info("Index: rebuilding from %d documents...", len(crawled_data))
+            self.inverted_index.clear()
+            self.documents.clear()
+            self.idf_scores.clear()
 
-        # TF (Term Frequency)
-        for url, text in self.documents.items():
-            tokens = self._preprocess_text(text)
-            for token in tokens:
-                self.inverted_index[token][url] += 1
+            self.documents = crawled_data
 
-        # IDF (Inverse Document Frequency)
-        num_documents = len(self.documents)
-        if num_documents == 0:
-            logging.warning("No documents to index.")
-            return
+            # TF
+            for url, text in self.documents.items():
+                for token in self._preprocess_text(text):
+                    self.inverted_index[token][url] += 1
 
-        for token, doc_freqs in self.inverted_index.items():
-            num_docs_with_token = len(doc_freqs)
-            self.idf_scores[token] = math.log(num_documents / (1 + num_docs_with_token))
+            # IDF
+            n_docs = len(self.documents)
+            if n_docs == 0:
+                logger.warning("Index: no documents to index.")
+                return
 
-        logging.info(f"Indexing complete. Indexed {len(self.inverted_index)} unique words.")
+            for token, doc_freqs in self.inverted_index.items():
+                num_docs_with_token = len(doc_freqs)
+                # +1 in denominator to avoid div-by-zero if something odd happens
+                self.idf_scores[token] = math.log(n_docs / (1 + num_docs_with_token))
 
-    def _generate_snippet(self, text: str, query_tokens: list[str], length: int = 250) -> str:
-        text_lower = text.lower()
-        first_match_index = -1
+            logger.info("Index: done. %d unique terms.", len(self.inverted_index))
 
-        for token in query_tokens:
-            try:
-                first_match_index = text_lower.index(token)
+    def _snippet(self, text: str, query_tokens: list[str], length: int = 250) -> str:
+        lower = text.lower()
+        first = -1
+        for tok in query_tokens:
+            idx = lower.find(tok)
+            if idx != -1:
+                first = idx
                 break
-            except ValueError:
-                continue
 
-        if first_match_index == -1:
-            return text[:length] + "..." if len(text) > length else text
+        if first == -1:
+            return (text[:length] + "...") if len(text) > length else text
 
-        start = max(0, first_match_index - length // 2)
-        end = start + length
+        start = max(0, first - length // 2)
+        end = min(len(text), start + length)
         snippet = text[start:end]
-
-        # Highlight all query tokens found in the snippet
-        for token in query_tokens:
-            snippet = re.sub(f'({re.escape(token)})', r'<strong>\1</strong>', snippet, flags=re.IGNORECASE)
-
+        # highlight
+        for tok in query_tokens:
+            snippet = re.sub(f"({re.escape(tok)})", r"<strong>\1</strong>", snippet, flags=re.IGNORECASE)
         prefix = "..." if start > 0 else ""
         suffix = "..." if end < len(text) else ""
         return f"{prefix}{snippet}{suffix}"
@@ -96,167 +127,231 @@ class Indexer:
         if not query_tokens:
             return []
 
-        try:
-            # Start with documents that contain the first token
-            matching_urls = set(self.inverted_index[query_tokens[0]].keys())
-        except KeyError:
-            return [] # First token not in index, so no results
+        with self._lock:
+            # start with first token postings
+            first = query_tokens[0]
+            if first not in self.inverted_index:
+                return []
 
-        # Find the intersection of documents for all tokens
-        for token in query_tokens[1:]:
-            matching_urls.intersection_update(self.inverted_index.get(token, {}).keys())
+            matching = set(self.inverted_index[first].keys())
+            for tok in query_tokens[1:]:
+                matching &= set(self.inverted_index.get(tok, {}).keys())
 
-        if not matching_urls:
-            return []
+            if not matching:
+                return []
 
-        # Calculate TF-IDF scores for matching documents
-        url_scores = defaultdict(float)
-        for url in matching_urls:
-            score = 0.0
-            for token in query_tokens:
-                tf = self.inverted_index[token].get(url, 0)
-                idf = self.idf_scores.get(token, 0)
-                score += tf * idf
-            url_scores[url] = score
+            scores: dict[str, float] = {}
+            for url in matching:
+                s = 0.0
+                for tok in query_tokens:
+                    tf = self.inverted_index.get(tok, {}).get(url, 0)
+                    idf = self.idf_scores.get(tok, 0.0)
+                    s += tf * idf
+                scores[url] = s
 
-        # Sort results by score
-        sorted_results = sorted(url_scores.items(), key=lambda item: item[1], reverse=True)
+            ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            results = []
+            for url, score in ranked:
+                results.append({
+                    "id": url,
+                    "score": round(score, 3),
+                    "snippet": self._snippet(self.documents.get(url, ""), query_tokens)
+                })
+            return results
 
-        # Format the final results
-        final_results = []
-        for url, score in sorted_results:
-            final_results.append({
-                "id": url,
-                "score": round(score, 2),
-                "snippet": self._generate_snippet(self.documents[url], query_tokens)
-            })
-        return final_results
-
+# =========================
+# Crawler
+# =========================
 class WebCrawler:
-    """A simple web crawler to fetch content from a single domain."""
-    def __init__(self, start_url: str, max_pages: int):
+    """Simple same-domain crawler with politeness and stop flag."""
+    def __init__(self, start_url: str, max_pages: int, stop_event: threading.Event):
         self.start_url = start_url
         self.max_pages = max_pages
-        self.visited_urls: set[str] = set()
-        self.url_queue: list[str] = [start_url]
-        self.crawled_data: dict[str, str] = {}
-        self.base_netloc = urlparse(start_url).netloc
+        self.stop_event = stop_event
 
-    def _is_valid_url(self, url: str) -> bool:
-        parsed_url = urlparse(url)
-        return parsed_url.scheme in ['http', 'https'] and parsed_url.netloc == self.base_netloc
+        self.base_netloc = urlparse(start_url).netloc
+        self.visited: set[str] = set()
+        self.queue: list[str] = [start_url]
+        self.data: dict[str, str] = {}
+        self.session = make_retrying_session()
+
+    def _same_domain(self, url: str) -> bool:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and p.netloc == self.base_netloc
 
     def crawl(self) -> dict[str, str]:
-        logging.info("Starting web crawl...")
-        while self.url_queue and len(self.crawled_data) < self.max_pages:
-            current_url = self.url_queue.pop(0)
-            if current_url in self.visited_urls:
+        logger.info("Crawl: starting at %s (max=%d)", self.start_url, self.max_pages)
+        while self.queue and len(self.data) < self.max_pages and not self.stop_event.is_set():
+            url = self.queue.pop(0)
+            if url in self.visited:
+                continue
+            self.visited.add(url)
+
+            logger.info("Crawl: (%d/%d) %s", len(self.data) + 1, self.max_pages, url)
+            try:
+                resp = self.session.get(url, timeout=12)
+                resp.raise_for_status()
+            except requests.RequestException as e:
+                logger.warning("Crawl: failed %s: %s", url, e)
                 continue
 
-            logging.info(f"Crawling ({len(self.crawled_data) + 1}/{self.max_pages}): {current_url}")
-            try:
-                response = requests.get(current_url, timeout=10, headers=HEADERS)
-                response.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
 
-                self.visited_urls.add(current_url)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # A simple way to get cleaner text
-                for script_or_style in soup(["script", "style"]):
-                    script_or_style.decompose()
-                page_text = ' '.join(soup.stripped_strings)
-                self.crawled_data[current_url] = page_text
+            text = " ".join(s.strip() for s in soup.stripped_strings)
+            self.data[url] = text
 
-                # Find new links to crawl
-                for link in soup.find_all('a', href=True):
-                    absolute_url = urljoin(current_url, link['href']).split('#')[0]
-                    if self._is_valid_url(absolute_url) and absolute_url not in self.visited_urls:
-                        self.url_queue.append(absolute_url)
-                
-                time.sleep(REQUEST_DELAY)
+            # discover links
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                abs_url = urljoin(url, href).split("#")[0]
+                if self._same_domain(abs_url) and abs_url not in self.visited:
+                    self.queue.append(abs_url)
 
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Failed to crawl {current_url}: {e}")
+            # polite delay
+            time.sleep(REQUEST_DELAY)
 
-        logging.info(f"Crawl finished. Found {len(self.crawled_data)} pages.")
-        return self.crawled_data
+        logger.info("Crawl: finished with %d pages.", len(self.data))
+        return self.data
 
-# --- Global State and Instances ---
-search_indexer = Indexer()
-_index_ready = False
+# =========================
+# Search Service (background worker)
+# =========================
+class SearchService:
+    """Owns the indexer, manages background indexing and readiness."""
+    def __init__(self, start_url: str, max_pages: int):
+        self.indexer = Indexer()
+        self.ready_event = threading.Event()
+        self.stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_once = False
+        self.start_url = start_url
+        self.max_pages = max_pages
+        self._guard_lock = threading.Lock()
 
-# --- API Endpoints ---
-@app.route("/", methods=["GET"])
-def home():
-    """Provides the status of the backend."""
-    status = "ready" if _index_ready else "indexing"
-    return jsonify({"message": "Backend is running", "status": status}), 200
+    def start_in_background(self):
+        """Start background indexing only once per process."""
+        with self._guard_lock:
+            if self._started_once:
+                logger.info("SearchService: background already started; skipping.")
+                return
+            self._started_once = True
 
-@app.route('/search', methods=['GET'])
-def search_api():
-    """The main search endpoint."""
-    if not _index_ready:
-        return jsonify({"error": "Index not ready yet. Try again in a moment."}), 503
+            def _worker():
+                logger.info("SearchService: worker started.")
+                try:
+                    crawler = WebCrawler(self.start_url, self.max_pages, self.stop_event)
+                    data = crawler.crawl()
+                    if data:
+                        self.indexer.rebuild(data)
+                        self.ready_event.set()
+                        logger.info("SearchService: ready ✅")
+                    else:
+                        logger.error("SearchService: no data crawled; staying not-ready.")
+                except Exception as e:
+                    logger.exception("SearchService: fatal worker error: %s", e)
+                finally:
+                    logger.info("SearchService: worker finished.")
 
-    query = request.args.get('q', '')
-    if not query:
-        return jsonify({"error": "Query parameter 'q' is required."}), 400
+            self._thread = threading.Thread(target=_worker, name="indexer-worker")
+            # Non-daemon to avoid stderr lock errors on shutdown
+            self._thread.start()
 
-    logging.info(f"Received search query: '{query}'")
-    
-    results = search_indexer.search(query)
+    def stop(self, join_timeout: float = 8.0):
+        """Signal worker to stop and join."""
+        self.stop_event.set()
+        t = self._thread
+        if t and t.is_alive():
+            t.join(timeout=join_timeout)
 
-    return jsonify({
-        "query": query,
-        "count": len(results),
-        "results": results
-    })
+    def is_ready(self) -> bool:
+        return self.ready_event.is_set()
 
-# --- Background Task for Crawling and Indexing ---
-# def crawl_and_build_index():
-#     """
-#     This function runs in a background thread.
-#     It crawls the web, builds the index, and sets the ready flag.
-#     """
-#     global _index_ready
-#     logging.info("Background indexing process started.")
-#     try:
-#         crawler = WebCrawler(start_url=STARTING_URL, max_pages=MAX_PAGES_TO_CRAWL)
-#         crawled_data = crawler.crawl()
-#         if crawled_data:
-#             search_indexer.create_index(crawled_data)
-#             _index_ready = True
-#             logging.info("✅ Search engine is now ready.")
-#         else:
-#             logging.error("Could not initialize search engine: No data was crawled.")
-#     except Exception as e:
-#         logging.exception(f"A critical error occurred during the index build: {e}")
+    def search(self, q: str) -> list[dict]:
+        return self.indexer.search(q)
 
+# =========================
+# Flask App Factory
+# =========================
+def create_app() -> Flask:
+    app = Flask(__name__)
+    CORS(app)
 
-def crawl_and_build_index():
-    global _index_ready
-    logging.info("Background indexing process started.")
-    try:
-        crawler = WebCrawler(start_url=STARTING_URL, max_pages=MAX_PAGES_TO_CRAWL)
-        crawled_data = crawler.crawl()
-        logging.info(f"Crawled {len(crawled_data)} pages.")
-        if crawled_data:
-            search_indexer.create_index(crawled_data)
-            _index_ready = True
-            logging.info("✅ Search engine is now ready.")
-        else:
-            logging.error("Could not initialize search engine: No data was crawled.")
-    except Exception as e:
-        logging.exception(f"A critical error occurred during the index build: {e}")
+    service = SearchService(STARTING_URL, MAX_PAGES_TO_CRAWL)
 
+    # Start background indexing exactly once per worker
+    service.start_in_background()
 
-# --- Start Background Thread ---
-# This code runs when Gunicorn starts the application.
-# It ensures the time-consuming crawl doesn't block the server.
-logging.info("Initializing search engine in a background thread...")
-indexing_thread = threading.Thread(target=crawl_and_build_index)
-indexing_thread.daemon = True  # Allows app to exit even if thread is running
-indexing_thread.start()
+    @app.route("/", methods=["GET"])
+    def home():
+        status = "ready" if service.is_ready() else "indexing"
+        return jsonify({
+            "message": "Backend is running",
+            "status": status,
+            "start_url": STARTING_URL,
+            "max_pages": MAX_PAGES_TO_CRAWL
+        }), 200
 
-# The 'if __name__ == "__main__"' block is removed because Gunicorn
-# does not run it. The background thread starts when the module is loaded.
+    @app.route("/search", methods=["GET"])
+    def search_api():
+        if not service.is_ready():
+            return jsonify({"error": "Index not ready yet. Try again in a moment."}), 503
+
+        query = request.args.get("q", "").strip()
+        if not query:
+            return jsonify({"error": "Query parameter 'q' is required."}), 400
+
+        logging.info("Search: '%s'", query)
+        results = service.search(query)
+        return jsonify({
+            "query": query,
+            "count": len(results),
+            "results": results
+        }), 200
+
+    @app.route("/status", methods=["GET"])
+    def status():
+        return jsonify({
+            "ready": service.is_ready(),
+            "start_url": STARTING_URL,
+            "max_pages": MAX_PAGES_TO_CRAWL
+        }), 200
+
+    # Optional: manual reindex (protect with a token in real deployments)
+    @app.route("/admin/reindex", methods=["POST"])
+    def admin_reindex():
+        # Very simple protection (improve for production)
+        token = request.headers.get("X-Admin-Token", "")
+        expected = os.getenv("ADMIN_TOKEN", "")
+        if not expected or token != expected:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # Restart background worker
+        service.stop()
+        # Reset readiness to force 503 until new index is built
+        service.ready_event.clear()
+        service.stop_event.clear()
+        service._started_once = False
+        service.start_in_background()
+        return jsonify({"message": "Reindex started"}), 202
+
+    # Graceful shutdown (Gunicorn/Flask)
+    def _graceful_shutdown(*_):
+        logger.info("Signal received: shutting down gracefully…")
+        service.stop()
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    atexit.register(service.stop)
+
+    # Attach service on app for debugging/tests if needed
+    app.search_service = service  # type: ignore[attr-defined]
+    return app
+
+# Gunicorn entrypoint: `gunicorn -w 2 -b 0.0.0.0:8000 api:app`
+app = create_app()
+
+if __name__ == "__main__":
+    # Flask dev run (single process). Avoid the reloader spawning duplicate workers.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=False, use_reloader=False)
