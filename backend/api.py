@@ -213,16 +213,33 @@ def search_api():
     })
 
 # --- Background Task for Crawling and Indexing ---
+# def crawl_and_build_index():
+#     """
+#     This function runs in a background thread.
+#     It crawls the web, builds the index, and sets the ready flag.
+#     """
+#     global _index_ready
+#     logging.info("Background indexing process started.")
+#     try:
+#         crawler = WebCrawler(start_url=STARTING_URL, max_pages=MAX_PAGES_TO_CRAWL)
+#         crawled_data = crawler.crawl()
+#         if crawled_data:
+#             search_indexer.create_index(crawled_data)
+#             _index_ready = True
+#             logging.info("✅ Search engine is now ready.")
+#         else:
+#             logging.error("Could not initialize search engine: No data was crawled.")
+#     except Exception as e:
+#         logging.exception(f"A critical error occurred during the index build: {e}")
+
+
 def crawl_and_build_index():
-    """
-    This function runs in a background thread.
-    It crawls the web, builds the index, and sets the ready flag.
-    """
     global _index_ready
     logging.info("Background indexing process started.")
     try:
         crawler = WebCrawler(start_url=STARTING_URL, max_pages=MAX_PAGES_TO_CRAWL)
         crawled_data = crawler.crawl()
+        logging.info(f"Crawled {len(crawled_data)} pages.")
         if crawled_data:
             search_indexer.create_index(crawled_data)
             _index_ready = True
@@ -231,6 +248,7 @@ def crawl_and_build_index():
             logging.error("Could not initialize search engine: No data was crawled.")
     except Exception as e:
         logging.exception(f"A critical error occurred during the index build: {e}")
+
 
 # --- Start Background Thread ---
 # This code runs when Gunicorn starts the application.
