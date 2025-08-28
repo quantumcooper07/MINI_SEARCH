@@ -191,7 +191,6 @@ def home():
     """Provides the status of the backend."""
     status = "ready" if _index_ready else "indexing"
     return jsonify({"message": "Backend is running", "status": status}), 200
-
 @app.route('/search', methods=['GET'])
 def search_api():
     """The main search endpoint."""
@@ -202,14 +201,19 @@ def search_api():
     if not query:
         return jsonify({"error": "Query parameter 'q' is required."}), 400
 
-    logging.info(f"Received search query: '{query}'")
+    # New parameter
+    category = request.args.get('category', None)
+
+    logging.info(f"Received search query: '{query}', category={category}")
     results = search_indexer.search(query)
 
     return jsonify({
         "query": query,
+        "category": category,
         "count": len(results),
         "results": results
     })
+
 
 # --- Background Task for Crawling and Indexing ---
 def crawl_and_build_index():
