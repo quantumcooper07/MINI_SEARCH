@@ -304,6 +304,10 @@ def create_app() -> Flask:
 
         logging.info("Search: '%s'", query)
         results = service.search(query)
+
+        print(results)
+
+        
         return jsonify({
             "query": query,
             "count": len(results),
